@@ -86,6 +86,7 @@ gboolean    na_overflow_popup            (NaOverflow  *self,
                                           GtkOrientation panel_orientation);
 void        na_overflow_popdown          (NaOverflow  *self);
 void        na_overflow_reposition       (NaOverflow  *self);
+void        na_overflow_fit_popup        (NaOverflow  *self);
 
 G_END_DECLS
 

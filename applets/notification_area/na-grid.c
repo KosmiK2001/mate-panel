@@ -120,7 +120,8 @@ G_DEFINE_TYPE (NaGrid, na_grid, GTK_TYPE_GRID)
 static gboolean
 overflow_grid_remap_idle (gpointer data)
 {
-  GtkWidget *grid = data;
+  NaGrid    *self = data;
+  GtkWidget *grid = na_overflow_get_grid (self->overflow);
   GList *children = gtk_container_get_children (GTK_CONTAINER (grid));
 
   for (GList *c = children; c != NULL; c = c->next)
@@ -139,7 +140,14 @@ overflow_grid_remap_idle (gpointer data)
     }
 
   g_list_free (children);
-  g_object_unref (grid);
+
+  /* Mapping the surfaces is what turns the icons' requests from the pre-map
+   * guess into their true size (measured: 78 -> 90 for three icons); the
+   * menu already latched the old size at popup.  Re-fit the popup window
+   * now, one frame after the map, so the FIRST open is not tight. */
+  na_overflow_fit_popup (self->overflow);
+
+  g_object_unref (self);
   return G_SOURCE_REMOVE;
 }
 
@@ -147,8 +155,21 @@ static void
 overflow_grid_map_cb (GtkWidget *grid,
                       gpointer   data)
 {
-  g_object_ref (grid);
-  g_idle_add (overflow_grid_remap_idle, grid);
+  NaGrid *self = data;
+
+  (void) grid;   /* same widget as na_overflow_get_grid (self->overflow) */
+
+  g_object_ref (self);
+  g_idle_add (overflow_grid_remap_idle, self);
+}
+
+static gboolean
+dbg_enter_cb (GtkWidget *w, GdkEvent *e, gpointer d)
+{
+  if (g_getenv ("NA_DEBUG") != NULL)
+    g_printerr ("NADBG ENTER %s flags=0x%x\n", G_OBJECT_TYPE_NAME (w),
+                gtk_widget_get_state_flags (w));
+  return FALSE;
 }
 
 static void refresh_grid (NaGrid *self);
@@ -165,7 +186,14 @@ static gboolean drawer_second_pass_cb (gpointer data);
 static gboolean
 drawer_second_pass_cb (gpointer data)
 {
-  refresh_grid ((NaGrid *) data);
+  NaGrid *self = data;
+
+  refresh_grid (self);
+
+  /* The request is now the post-map one (measured: 78 -> 90 once the SNI
+   * surfaces arrived); the latched popup allocation is not.  Re-fit. */
+  na_overflow_fit_popup (self->overflow);
+
   return G_SOURCE_REMOVE;
 }
 
@@ -195,18 +223,52 @@ drawer_remap_cb (gpointer data)
        * suppressed by CSS). */
       gtk_widget_add_events (item,
                              GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+      g_signal_connect (item, "enter-notify-event",
+                        G_CALLBACK (dbg_enter_cb), NULL);
       g_object_unref (item);
     }
 
   g_list_free (children);
 
   refresh_grid (self);
+  if (g_getenv ("NA_DEBUG") != NULL)
+    {
+      GList *ch2 = gtk_container_get_children (GTK_CONTAINER (grid));
+      for (GList *x = ch2; x != NULL; x = x->next)
+        {
+          GtkWidget *it = x->data;
+          gint mn = 0, nt = 0, mh = 0, nh = 0, imn = 0, inat = 0;
+          GtkAllocation al;
 
+          if (!SN_IS_ITEM (it))
+            continue;
+
+          gtk_widget_get_preferred_width (it, &mn, &nt);
+          gtk_widget_get_preferred_height (it, &mh, &nh);
+          gtk_widget_get_allocation (it, &al);
+
+          GtkWidget *img = gtk_bin_get_child (GTK_BIN (it));
+          if (img != NULL && GTK_IS_IMAGE (img))
+            gtk_widget_get_preferred_width (img, &imn, &inat);
+
+          g_printerr ("NADBG measure %s pref=%d/%d x %d/%d alloc=%dx%d "
+                      "child=%s(%d/%d)\n",
+                      G_OBJECT_TYPE_NAME (it), mn, nt, mh, nh,
+                      al.width, al.height,
+                      img ? G_OBJECT_TYPE_NAME (img) : "none", imn, inat);
+        }
+      g_list_free (ch2);
+    }
   /* The cells are computed from the icons' requisitions, and right after the
    * re-parenting those are still the pre-map ones - measured on the live tray:
    * the first open packed the icons tight and only the next open spaced them
    * properly.  One more pass once mapping has settled fixes the first open. */
   g_timeout_add (120, drawer_second_pass_cb, self);
+
+  /* And re-fit the latched popup allocation to the new request (a mapped
+   * GtkMenu does not follow its children - see na_overflow_fit_popup). */
+  na_overflow_fit_popup (self->overflow);
+
   return G_SOURCE_REMOVE;
 }
 
@@ -1073,8 +1135,44 @@ layout_overflow_grid (NaGrid  *self,
        * exactly the overlap being fixed here. */
       if (SN_IS_ITEM (widget))
         {
-          gtk_widget_set_size_request (cell, extent, extent);
-          cell_w = extent;
+          gint cur = -1, mn = 0, nt = 0;
+
+          /* Pre-heat the icon surface to its drawer size NOW.
+           *
+           * The surface inside the button is sized from the item's
+           * "icon-size" property (or from its allocation while that is 0),
+           * and overflow items are never allocated before the drawer's
+           * first popup: measured pre-map pref 5/5 (empty button) against
+           * 30/30 once mapped, i.e. 4px of theme chrome that no style query
+           * reports (padding/border/margin all read 0 in NORMAL and in
+           * BACKDROP).  Pinning the property makes sn_item_v0 render the
+           * surface at `extent` immediately, so the button's natural width
+           * is final BEFORE gtk_menu_popup() latches the menu's requisition
+           * - the only chance, since an xdg_popup cannot be resized
+           * afterwards (measured: gtk_window_resize on a mapped menu is
+           * swallowed by GDK).
+           *
+           * The bindings are unidirectional (G_BINDING_DEFAULT = source ->
+           * target): grid -> host -> item, so pinning the item does NOT
+           * flow back into the grid's own icon-size and cannot freeze the
+           * panel extent.  Self-healing: any real host change overwrites
+           * this and the next refresh re-pins it; items returning to the
+           * panel are unpinned by the pass below. */
+          if (g_object_class_find_property (G_OBJECT_GET_CLASS (widget),
+                                            "icon-size") != NULL)
+            {
+              g_object_get (widget, "icon-size", &cur, NULL);
+              if (cur != extent)
+                g_object_set (widget, "icon-size", extent, NULL);
+            }
+
+          gtk_widget_get_preferred_width (widget, &mn, &nt);
+          cell_w = MAX (extent, nt);
+          gtk_widget_set_size_request (cell, cell_w, extent);
+
+          if (g_getenv ("NA_DEBUG") != NULL)
+            g_printerr ("NADBG   sni-cell extent=%d cur_is=%d pref=%d/%d"
+                        " -> cell %d\n", extent, cur, mn, nt, cell_w);
         }
       else
         {
@@ -1392,6 +1490,25 @@ refresh_grid (NaGrid *self)
    * row does not shift sideways when icons arrive or leave the overflow. */
   if (show_chevron)
     layout_place (self->chevron, &data);
+
+  /* Undo the drawer's icon-size pre-heat (see layout_overflow_grid) for items
+   * coming back to the panel: there the size has to follow the allocation
+   * again, so a panel resize or a rows change re-renders the surface.  The
+   * grid's own setting (0 = auto) is exactly what the host binding holds. */
+  for (GSList *l = pinned; l != NULL; l = l->next)
+    {
+      GtkWidget *w = GTK_WIDGET (l->data);
+
+      if (SN_IS_ITEM (w) &&
+          g_object_class_find_property (G_OBJECT_GET_CLASS (w),
+                                        "icon-size") != NULL)
+        {
+          gint cur = -1;
+          g_object_get (w, "icon-size", &cur, NULL);
+          if (cur != self->icon_size)
+            g_object_set (w, "icon-size", self->icon_size, NULL);
+        }
+    }
 
   g_slist_foreach (pinned, (GFunc) layout_place, &data);
 

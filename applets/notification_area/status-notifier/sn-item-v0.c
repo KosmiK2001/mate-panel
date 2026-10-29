@@ -1350,7 +1350,13 @@ sn_item_v0_get_property (GObject    *object,
   switch (property_id)
     {
       case PROP_ICON_SIZE:
-        g_value_set_uint (value, v0->icon_size);
+        /* The interface spec declares icon-size as INT (na-host.c); the
+         * upstream g_value_set_uint here failed its type assertion, so every
+         * read through the host<->item binding emitted a GLib-CRITICAL and
+         * handed back an unset value - the binding then pushed 0 back into
+         * the item, silently reverting any icon-size we had just set
+         * (measured: pre-heat set 26, immediate read-back returned 0). */
+        g_value_set_int (value, v0->icon_size);
         break;
 
       case PROP_ICON_PADDING:
