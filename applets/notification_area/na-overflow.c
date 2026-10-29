@@ -29,11 +29,17 @@
 #include "na-overflow.h"
 #include "na-item.h"
 
+/* The drawer hover/tooltip machinery is connected only from the Wayland
+ * menu path, and its handlers are defined under HAVE_WAYLAND - so must the
+ * forward declarations be (an X11-only build warns "declared static but
+ * never defined" otherwise, measured). */
+#ifdef HAVE_WAYLAND
 static gboolean na_overflow_hover_motion_cb (GtkWidget *widget, GdkEventMotion *event, gpointer user_data);
 static gboolean na_overflow_stripe_draw_cb (GtkWidget *item, cairo_t *cr, gpointer user_data);
 static gboolean na_overflow_cell_enter_cb (GtkWidget *child, GdkEventCrossing *event, gpointer user_data);
 static gboolean na_overflow_cell_leave_cb (GtkWidget *child, GdkEventCrossing *event, gpointer user_data);
 static void     na_overflow_grid_child_added_cb (GtkContainer *grid, GtkWidget *child, gpointer user_data);
+#endif
 
 
 enum
