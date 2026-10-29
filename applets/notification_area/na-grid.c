@@ -51,6 +51,9 @@
  * a small grid rather than one long row. */
 #define NA_OVERFLOW_COLUMNS 5
 
+/* How long the chevron's tooltip is allowed to explain the arrow, in ms. */
+#define CHEVRON_TOOLTIP_MS 2000
+
 typedef struct
 {
   GtkGrid        *grid;
@@ -95,6 +98,8 @@ struct _NaGrid
   guint       park_idle;       /* idle source id, 0 when none pending */
   guint       remap_timeout;   /* drawer_remap_cb, 0 when none pending */
   guint       second_pass_timeout; /* drawer_second_pass_cb, 0 when none */
+  guint       tooltip_hide;    /* chevron tooltip auto-hide timer, 0 = none */
+  guint       tooltip_hold_down; /* tooltip suppressed until the pointer leaves */
 
   guint       relaying;
   guint       relayout_dirty;
@@ -1643,6 +1648,95 @@ na_grid_set_min_icon_size (NaGrid *grid,
   refresh_grid (grid);
 }
 
+/* The chevron's tooltip explains the arrow once, then it is in the way: on a
+ * bottom panel the drawer grows UP into exactly the spot the tooltip
+ * occupies, so the label of an open drawer covers the drawer.  Three rules:
+ *
+ *  - it may live for CHEVRON_TOOLTIP_MS at most (the timer dismisses it),
+ *  - it never shows while the drawer is open,
+ *  - it comes back for the next hover once the pointer has left the arrow.
+ *
+ * Dismissal is gtk_widget_set_has_tooltip(FALSE) + a tooltip re-query: the
+ * query path has an explicit branch "the widget does not want tooltips ->
+ * popdown the visible one", which is the only public way to take a tooltip
+ * down - GTK offers no force-hide.  Returning FALSE from the query handler
+ * is NOT that way: FALSE means "fall through to the default handler", which
+ * re-applies the tooltip_text and SHOWS the label - measured: the timer's
+ * re-query re-rendered the tooltip every 2 s instead of hiding it.  The Atk
+ * name is set separately and untouched, so a screen reader still gets the
+ * string. */
+static gboolean
+chevron_tooltip_hold_cb (gpointer data)
+{
+  NaGrid *self = data;
+
+  self->tooltip_hide = 0;
+  self->tooltip_hold_down = TRUE;
+  gtk_widget_set_has_tooltip (self->chevron, FALSE);
+  gtk_widget_trigger_tooltip_query (self->chevron);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+chevron_tooltip_dismiss (NaGrid *self)
+{
+  if (self->tooltip_hide != 0)
+    {
+      g_source_remove (self->tooltip_hide);
+      self->tooltip_hide = 0;
+    }
+
+  self->tooltip_hold_down = TRUE;
+  gtk_widget_set_has_tooltip (self->chevron, FALSE);
+  gtk_widget_trigger_tooltip_query (self->chevron);
+}
+
+/* Runs BEFORE the default handler, which is what applies tooltip_text.
+ * Answering FALSE here would therefore show the label, not suppress it, so
+ * the suppression lives in has_tooltip (see above) and this handler only
+ * arms the dwell timer for the tooltip the default handler is about to
+ * present. */
+static gboolean
+chevron_query_tooltip_cb (GtkWidget   *widget,
+                          gint         x,
+                          gint         y,
+                          gboolean     keyboard_mode,
+                          GtkTooltip  *tooltip,
+                          NaGrid      *self)
+{
+  (void) widget; (void) x; (void) y; (void) keyboard_mode; (void) tooltip;
+
+  if (self->tooltip_hide != 0)
+    g_source_remove (self->tooltip_hide);
+  self->tooltip_hide = g_timeout_add (CHEVRON_TOOLTIP_MS,
+                                      chevron_tooltip_hold_cb, self);
+
+  return FALSE;   /* default handler sets the text */
+}
+
+static gboolean
+chevron_leave_notify_cb (GtkWidget        *widget,
+                         GdkEventCrossing *event,
+                         NaGrid           *self)
+{
+  (void) widget; (void) event;
+
+  /* Off the arrow: re-arm the tooltip for the next hover. */
+  if (self->tooltip_hide != 0)
+    {
+      g_source_remove (self->tooltip_hide);
+      self->tooltip_hide = 0;
+    }
+  if (self->tooltip_hold_down)
+    {
+      self->tooltip_hold_down = FALSE;
+      gtk_widget_set_has_tooltip (self->chevron, TRUE);
+    }
+
+  return FALSE;   /* normal propagation continues */
+}
+
 static void
 chevron_toggled_cb (GtkToggleButton *button,
                     NaGrid          *self)
@@ -1675,6 +1769,10 @@ chevron_toggled_cb (GtkToggleButton *button,
   if (!park_xembed_now (self))
     schedule_park (self);   /* not everything fitted yet: finish from the queue */
   reposition_parked (self);
+
+  /* The label of the arrow must not cover the drawer it opened (see the
+   * tooltip block above). */
+  chevron_tooltip_dismiss (self);
 
   /* Tracked and re-armed, never a second copy in flight: the callbacks
    * dereference the grid, and an untracked one surviving dispose is a
@@ -1852,9 +1950,15 @@ na_grid_init (NaGrid *self)
                         gtk_image_new_from_icon_name ("pan-down-symbolic", GTK_ICON_SIZE_MENU));
   gtk_image_set_pixel_size (GTK_IMAGE (gtk_button_get_image (GTK_BUTTON (self->chevron))), 16);
   gtk_widget_set_can_focus (self->chevron, TRUE);
+  /* Sets has_tooltip, which is what makes the query below run at all; the
+   * text itself is supplied by the handler, which also enforces the dwell. */
   gtk_widget_set_tooltip_text (self->chevron, _("Show hidden tray icons"));
   atk_object_set_name (gtk_widget_get_accessible (self->chevron),
                        _("Show hidden tray icons"));
+  g_signal_connect (self->chevron, "query-tooltip",
+                    G_CALLBACK (chevron_query_tooltip_cb), self);
+  g_signal_connect (self->chevron, "leave-notify-event",
+                    G_CALLBACK (chevron_leave_notify_cb), self);
   gtk_widget_set_no_show_all (self->chevron, TRUE);
   gtk_widget_show (self->chevron);
   /* Placeholder position; refresh_grid() puts it in the last cell. */
@@ -2111,6 +2215,12 @@ na_grid_dispose (GObject *object)
     {
       g_source_remove (self->remap_timeout);
       self->remap_timeout = 0;
+    }
+
+  if (self->tooltip_hide != 0)
+    {
+      g_source_remove (self->tooltip_hide);
+      self->tooltip_hide = 0;
     }
 
   if (self->second_pass_timeout != 0)
