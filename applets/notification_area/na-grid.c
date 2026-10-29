@@ -1722,13 +1722,16 @@ chevron_leave_notify_cb (GtkWidget        *widget,
 {
   (void) widget; (void) event;
 
-  /* Off the arrow: re-arm the tooltip for the next hover. */
+  /* Off the arrow: re-arm the tooltip for the next hover - but only while
+   * the drawer is down, otherwise moving from the arrow into the drawer and
+   * back would re-arm it right on top of the open drawer (measured). */
   if (self->tooltip_hide != 0)
     {
       g_source_remove (self->tooltip_hide);
       self->tooltip_hide = 0;
     }
-  if (self->tooltip_hold_down)
+  if (self->tooltip_hold_down &&
+      !gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (self->chevron)))
     {
       self->tooltip_hold_down = FALSE;
       gtk_widget_set_has_tooltip (self->chevron, TRUE);
@@ -1802,6 +1805,16 @@ overflow_closed_cb (NaOverflow *overflow,
    * forever: pointer and keyboard belonged to a popup that could not be
    * dismissed, and killing the panel was the only escape. */
   na_overflow_popdown (self->overflow);
+
+  /* The drawer is down: the arrow may explain itself again on the next
+   * hover.  Restoring has_tooltip does not pop anything up by itself - GTK
+   * only re-queries on pointer motion - so a pointer resting on the arrow
+   * when the drawer closes does not get a surprise label. */
+  if (self->tooltip_hold_down)
+    {
+      self->tooltip_hold_down = FALSE;
+      gtk_widget_set_has_tooltip (self->chevron, TRUE);
+    }
 }
 
 static void
