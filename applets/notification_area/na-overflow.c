@@ -1882,9 +1882,41 @@ na_overflow_popup (NaOverflow   *self,
         gint   fw = 0, fh = 0;
 
         for (c = ch; c != NULL; c = c->next)
-          if (gtk_widget_get_visible (c->data))
-            nvis++;
+          {
+            GtkWidget *w = c->data;
+
+            /* sn-item-v0.update() hides Status="Passive" items, and it runs
+             * 10 ms after ANY property change - including the icon-size
+             * pre-heat above.  When the first click lands in that window
+             * every drawer child is invisible, the grid requests nothing
+             * (the size filter reads get_visible only), and the menu
+             * latches a 10x30 microstrip with scroll arrows (measured).
+             * Inside the drawer the passivity policy is superseded by the
+             * layout anyway (layout_overflow_grid shows every cell), so
+             * state it here too, before measuring.  XEmbed placeholders
+             * keep their invisibility on purpose - only SNI buttons are
+             * forced. */
+            if (g_str_has_prefix (G_OBJECT_TYPE_NAME (w), "SnItem") &&
+                !gtk_widget_get_visible (w))
+              gtk_widget_show (w);
+
+            if (gtk_widget_get_visible (w))
+              nvis++;
+          }
         g_list_free (ch);
+
+        /* Unconditional probe: the first open of a session skipped the freeze
+         * silently (latch 10x30, microstrip with scroll arrows) while every
+         * later open froze correctly - one of the two terms must have been 0
+         * at that exact moment; print them instead of guessing which. */
+        if (g_getenv ("NA_DEBUG") != NULL)
+          {
+            GtkRequisition gr;
+            gtk_widget_get_preferred_size (self->grid, NULL, &gr);
+            g_printerr ("NADBG freeze-check: nvis=%d nominal=%dx%d cache=%dx%d\n",
+                        nvis, self->nominal_w, self->nominal_h,
+                        gr.width, gr.height);
+          }
 
         if (nvis > 0 && self->nominal_w > 1)
           {
