@@ -787,17 +787,33 @@ na_overflow_menu_motion_cb (GtkWidget      *widget,
     {
       if (self->hover_item != NULL)
         self->leave_at = 0;
+      else if (self->leave_at == 0)
+        self->leave_at = g_get_monotonic_time ();
 
       return FALSE;
     }
 
   /* On the shell's own window the coordinates are ROOT-relative (measured:
-   * (1907,15) for a popup recorded at (1886,27)), so they compare against the
-   * rect computed at open time. */
-  inside = event->x >= self->menu_rect.x &&
-           event->x <  self->menu_rect.x + self->menu_rect.width  &&
-           event->y >= self->menu_rect.y &&
-           event->y <  self->menu_rect.y + self->menu_rect.height;
+   * the confined grab keeps delivering while the pointer is physically
+   * off the surface, and those events carry root coordinates - the item
+   * handler downstream sees them re-anchored to the surface). So they
+   * compare against the rect computed at open time.
+   *
+   * The rect is the part that was lieable: it used to be built from
+   * gdk_window_get_origin() of the panel, which answers SURFACE-relative
+   * for the layer-shell surface (measured: y=1 for a panel at y=1053), so
+   * a bottom panel's drawer rect came out at the TOP of the screen and a
+   * pointer led through that phantom area read "inside", clearing the
+   * outside stamp (the seam-gesture hang). na_overflow_popup() now derives
+   * the rect from the monitor geometry and the panel edge instead - both
+   * truthful - and this comparison is sound again. */
+  /* Compare ROOT coordinates (event->x_root/y_root are root by GDK
+   * contract, whatever space event->x/y happens to be in - the two have
+   * been measured to disagree on this popup). */
+  inside = event->x_root >= self->menu_rect.x &&
+           event->x_root <  self->menu_rect.x + self->menu_rect.width  &&
+           event->y_root >= self->menu_rect.y &&
+           event->y_root <  self->menu_rect.y + self->menu_rect.height;
 
   if (inside)
     self->leave_at = 0;
@@ -805,6 +821,58 @@ na_overflow_menu_motion_cb (GtkWidget      *widget,
     self->leave_at = g_get_monotonic_time ();
 
   return FALSE;   /* normal propagation continues */
+}
+
+/* Last-resort outside detector: watch every pointer event this process
+ * receives while the drawer is up.
+ *
+ * The popup's own channels die silently when the pointer exits through the
+ * seam between the drawer's corner and the panel (measured twice): the last
+ * motion still reads inside, nothing arrives afterwards, leave_at stays 0
+ * and the poll keeps answering "inside" - the drawer hangs open forever.
+ * The seam phantom stamp catches the variant where a stale motion carrying
+ * the icon's window still arrives; this catches the variant where NOTHING
+ * arrives on the popup any more but the pointer keeps moving over our other
+ * surfaces (the panel): wayfire does not confine the popup grab the way
+ * xdg-shell suggests, events resume on the panel's window.
+ *
+ * Positive evidence only: this stamps "outside" when an event arrives on a
+ * window that is neither the popup nor one of its descendants, and never
+ * clears a stamp - so it cannot resurrect the phantom-leave class (a real
+ * hover inside the drawer produces no events on foreign windows). */
+static gboolean
+na_overflow_display_event_cb (GdkDisplay *display,
+                              GdkEvent   *event,
+                              gpointer    user_data)
+{
+  NaOverflow *self = user_data;
+  GdkWindow  *win, *popup;
+
+  (void) display;
+
+  if (!self->menu_up)
+    return FALSE;
+
+  if (event->type != GDK_MOTION_NOTIFY && event->type != GDK_ENTER_NOTIFY &&
+      event->type != GDK_LEAVE_NOTIFY)
+    return FALSE;
+
+  win   = event->motion.window;
+  popup = gtk_widget_get_window (self->menu);
+  if (win == NULL || popup == NULL || win == popup)
+    return FALSE;
+
+  /* an icon's own subsurface is still inside the drawer */
+  for (GdkWindow *p = gdk_window_get_parent (win);
+       p != NULL;
+       p = gdk_window_get_parent (p))
+    if (p == popup)
+      return FALSE;
+
+  if (self->leave_at == 0)
+    self->leave_at = g_get_monotonic_time ();
+
+  return FALSE;
 }
 
 /* Crossings on the wrapper item.
@@ -1374,6 +1442,12 @@ na_overflow_new (void)
        * here that tells the truth about where the pointer is. */
       g_signal_connect (self->menu, "motion-notify-event",
                         G_CALLBACK (na_overflow_menu_motion_cb), self);
+
+      /* The popup's own channels can die mid-flight (see the display-event
+       * handler); the object connection auto-disconnects at dispose. */
+      g_signal_connect_object (gdk_display_get_default (), "event",
+                               G_CALLBACK (na_overflow_display_event_cb),
+                               self, 0);
     }
 #endif
 
@@ -1806,6 +1880,20 @@ dbg_later_cb (gpointer data)
   return FALSE;
 }
 
+#ifdef HAVE_WAYLAND
+/* Horizontal root position of a top/bottom panel's surface: full-width
+ * panels (the common case) land on g.x; a narrower x-centered one is
+ * centered. A right/left-anchored narrow horizontal panel is the one shape
+ * this cannot know - it degrades to the centered guess, which is still
+ * bounded by the monitor. */
+static gint
+mg_x_centered (GdkRectangle      g,
+               GtkAllocation     ta)
+{
+  return g.x + (g.width - ta.width) / 2;
+}
+#endif
+
 gboolean
 na_overflow_popup (NaOverflow   *self,
                    GtkWidget    *relative_to,
@@ -1865,7 +1953,50 @@ na_overflow_popup (NaOverflow   *self,
 
           if (mon != NULL)
             gdk_monitor_get_geometry (mon, &g);
-          gdk_window_get_origin (rw, &rx, &ry);
+#ifdef HAVE_WAYLAND
+          /* The panel's layer-shell surface cannot be asked where it is:
+           * gdk_window_get_origin() answers SURFACE-relative there
+           * (measured: y=1 for a panel at y=1053, and (0,0) for popup
+           * surfaces). Everything needed IS available truthfully though:
+           * the monitor geometry (root space), the edge the panel sits on
+           * (the applet protocol, see na_grid's open_direction), and the
+           * panel's own size (its toplevel allocation). Derive the
+           * surface's root position from those. The rect this feeds is the
+           * auto-hide's "inside" test - when it was built from the lying
+           * origin, a bottom panel's drawer rect landed at the TOP of the
+           * screen and the confined-grab motions read "inside" forever
+           * (the seam-gesture hang, reproduced twice). */
+          if (self->use_menu && self->open_direction != NA_OPEN_UNKNOWN)
+            {
+              GtkWidget   *top = gtk_widget_get_toplevel (relative_to);
+              GtkAllocation ta = { 0, 0, 1, 1 };
+
+              if (top != NULL)
+                gtk_widget_get_allocation (top, &ta);
+
+              switch (self->open_direction)
+                {
+                case NA_OPEN_UP:    /* panel at the BOTTOM edge */
+                  rx = mg_x_centered (g, ta);
+                  ry = g.y + g.height - ta.height;
+                  break;
+                case NA_OPEN_DOWN:  /* panel at the TOP edge */
+                  rx = mg_x_centered (g, ta);
+                  ry = g.y;
+                  break;
+                case NA_OPEN_RIGHT: /* panel at the LEFT edge */
+                  rx = g.x;
+                  ry = g.y + (g.height - ta.height) / 2;
+                  break;
+                default:            /* NA_OPEN_LEFT: panel at the RIGHT edge */
+                  rx = g.x + g.width - ta.width;
+                  ry = g.y + (g.height - ta.height) / 2;
+                  break;
+                }
+            }
+          else
+#endif
+            gdk_window_get_origin (rw, &rx, &ry);
           gtk_widget_get_allocation (relative_to, &rel_alloc);
           root_x = rx + rel_alloc.x;
           root_y = ry + rel_alloc.y;
@@ -2105,7 +2236,14 @@ na_overflow_popup (NaOverflow   *self,
        * outside, so the auto-hide timer starts ticking.
        *
        * Trustworthy exactly here: no menu grab exists yet (the popup opens
-       * below), so gdk_device_get_position() answers root coordinates. */
+       * below), so gdk_device_get_position() answers root coordinates.
+       *
+       * The RECT itself is a guess (built from gdk_window_get_origin() of the
+       * panel, which answers surface-relative on Wayland), so for a bottom
+       * panel this seed can be wrong in either direction - harmless: the
+       * first real event overwrites it, and nothing else compares against
+       * menu_rect any more (see na_overflow_menu_motion_cb for why the
+       * coordinate comparison had to go). */
       {
         GdkDisplay *dpy    = gdk_screen_get_display (gtk_widget_get_screen (relative_to));
         GdkSeat    *st     = gdk_display_get_default_seat (dpy);
