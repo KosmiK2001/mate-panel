@@ -29,17 +29,17 @@
 #include "na-overflow.h"
 #include "na-item.h"
 
-/* The drawer hover/tooltip machinery is connected only from the Wayland
- * menu path, and its handlers are defined under HAVE_WAYLAND - so must the
- * forward declarations be (an X11-only build warns "declared static but
- * never defined" otherwise, measured). */
-#ifdef HAVE_WAYLAND
+/* The hover highlight serves BOTH drawer backends - the Wayland menu popup
+ * and the X11 POPUP window - so these handlers and their declarations are
+ * unconditional.  What stays Wayland-only is the menu-specific plumbing: the
+ * event shield, the item crossings, the display watchdog and the grab poll
+ * (an X11-only build warns "declared static but never defined" if a gated
+ * declaration outlives its definition, measured). */
 static gboolean na_overflow_hover_motion_cb (GtkWidget *widget, GdkEventMotion *event, gpointer user_data);
 static gboolean na_overflow_stripe_draw_cb (GtkWidget *item, cairo_t *cr, gpointer user_data);
 static gboolean na_overflow_cell_enter_cb (GtkWidget *child, GdkEventCrossing *event, gpointer user_data);
 static gboolean na_overflow_cell_leave_cb (GtkWidget *child, GdkEventCrossing *event, gpointer user_data);
 static void     na_overflow_grid_child_added_cb (GtkContainer *grid, GtkWidget *child, gpointer user_data);
-#endif
 
 
 enum
@@ -51,6 +51,7 @@ enum
 static guint overflow_signals[LAST_SIGNAL] = { 0 };
 
 static void na_overflow_position (NaOverflow *self);
+static gboolean na_overflow_point_in_widget (GtkWidget *widget, gint px, gint py);
 #ifdef HAVE_WAYLAND
 static void na_overflow_arm_grab_poll (NaOverflow *self);
 #endif
@@ -214,6 +215,21 @@ na_overflow_pointer_inside (NaOverflow *self)
     return FALSE;
 
   gdk_device_get_position (pointer, NULL, &px, &py);
+
+  /* The arrow the drawer was opened from counts as inside, exactly like the
+   * Wayland menu path treats a crossing back onto the chevron as a reason to
+   * stay open.  Without this the X11 poll folded the drawer 800 ms after it
+   * opened while the pointer was STILL ON THE ARROW that opened it (measured:
+   * "opened it and left the cursor there - the drawer closed itself"), and a
+   * fast click sequence then raced the fold against the toggle, which is what
+   * made some clicks look dead (the next click hit a drawer that had just
+   * closed itself and only had to be flipped back).
+   *
+   * The click-watch above already exempts the arrow for the same reason -
+   * this brings the poll into line with it. */
+  if (na_overflow_point_in_widget (self->relative_to, px, py))
+    return TRUE;
+
   gdk_window_get_origin (window, &ox, &oy);
   w = gdk_window_get_width (window);
   h = gdk_window_get_height (window);
@@ -1032,33 +1048,6 @@ na_overflow_cancel_grab_poll (NaOverflow *self)
     }
 }
 
-/* Wrapper item handler on the menu path: keeps the shell out of it AND
- * delivers clicks to the icon under the cursor.
- *
- * Why the shield is needed at all:
- *  - GtkMenuShell's release handler deactivates the menu when the release lands
- *    on the selected item (gtkmenushell.c: "menu_item == active_menu_item &&
- *    is_selectable" -> gtk_menu_shell_activate_item -> deactivate). Our item
- *    only carries the icon grid, so that path closed the drawer on every click.
- *  - Its enter_notify selects the item under the pointer, and a selected
- *    GtkMenuItem is prelit: the theme paints one giant highlight row behind the
- *    whole grid.
- * GTK3 GtkMenuItem has no "selectable" property (that is GTK4), so the events
- * are blocked here instead.
- *
- * Why a button event must be REDISPATCHED here rather than left to propagate:
- * the shell grabs the pointer when it pops up (gtk_menu_shell_activate ->
- * gtk_grab_add), so GDK routes BUTTON events to the grab and not to the deepest
- * window - measured: every press and release inside the drawer reports
- * event_widget=GtkMenuItem and the SnItem buttons never see them. Crossings are
- * geometric and do reach the buttons, which is exactly why hover/prelight
- * worked while clicking did nothing. The earlier assumption that "events start
- * at the deepest widget and walk up, so the buttons have already had their
- * turn" is false under a menu grab.
- *
- * So the manual button redispatch is gone; what remains of the shield is the
- * crossing bookkeeping and stopping the shell from seeing presses at all. */
-#ifdef HAVE_WAYLAND
 /* Which grid child is under the pointer, resolved from an event WITHOUT
  * trusting a single coordinate space.
  *
@@ -1253,6 +1242,33 @@ na_overflow_set_hover (NaOverflow *self,
                 owned ? G_OBJECT_TYPE_NAME (owned) : "none");
 }
 
+/* Wrapper item handler on the menu path: keeps the shell out of it AND
+ * delivers clicks to the icon under the cursor.
+ *
+ * Why the shield is needed at all:
+ *  - GtkMenuShell's release handler deactivates the menu when the release lands
+ *    on the selected item (gtkmenushell.c: "menu_item == active_menu_item &&
+ *    is_selectable" -> gtk_menu_shell_activate_item -> deactivate). Our item
+ *    only carries the icon grid, so that path closed the drawer on every click.
+ *  - Its enter_notify selects the item under the pointer, and a selected
+ *    GtkMenuItem is prelit: the theme paints one giant highlight row behind the
+ *    whole grid.
+ * GTK3 GtkMenuItem has no "selectable" property (that is GTK4), so the events
+ * are blocked here instead.
+ *
+ * Why a button event must be REDISPATCHED here rather than left to propagate:
+ * the shell grabs the pointer when it pops up (gtk_menu_shell_activate ->
+ * gtk_grab_add), so GDK routes BUTTON events to the grab and not to the deepest
+ * window - measured: every press and release inside the drawer reports
+ * event_widget=GtkMenuItem and the SnItem buttons never see them. Crossings are
+ * geometric and do reach the buttons, which is exactly why hover/prelight
+ * worked while clicking did nothing. The earlier assumption that "events start
+ * at the deepest widget and walk up, so the buttons have already had their
+ * turn" is false under a menu grab.
+ *
+ * So the manual button redispatch is gone; what remains of the shield is the
+ * crossing bookkeeping and stopping the shell from seeing presses at all. */
+#ifdef HAVE_WAYLAND
 static gboolean
 na_overflow_menu_event_shield (GtkWidget *widget,
                                GdkEvent  *event,
@@ -1289,6 +1305,46 @@ na_overflow_menu_event_shield (GtkWidget *widget,
   return TRUE;   /* the shell never sees it: no deactivate, no prelight */
 }
 #endif
+
+/* Flatten the drawer chrome for BOTH backends: the host surface loses the
+ * theme's menuitem prelight (a selected GtkMenuItem paints one giant row
+ * behind the grid), and the icons lose their button chrome - the hover
+ * highlight is painted by the band handler UNDERNEATH them, so any opaque
+ * button background would hide it again.
+ *
+ * For the screen, not for one widget's context: a provider added to a single
+ * context applies to that widget only, so a rule targeting the icons never
+ * reaches them from a context call.  Installed once and never removed: the
+ * rules are identical every time, the classes are ours, and removing the
+ * provider would break a drawer that exists meanwhile. */
+static void
+na_overflow_install_flat_css (void)
+{
+  static GtkCssProvider *prov = NULL;
+
+  if (prov != NULL)
+    return;
+
+  prov = gtk_css_provider_new ();
+
+  gtk_css_provider_load_from_data (prov,
+      "menuitem.na-overflow-host,"
+      "menuitem.na-overflow-host:hover,"
+      "menuitem.na-overflow-host:selected {"
+      "  background: none;"
+      "  background-image: none;"
+      "  box-shadow: none; }"
+      ".na-overflow-icon {"
+      "  background: none;"
+      "  background-image: none;"
+      "  border-color: transparent;"
+      "  box-shadow: none; }", -1, NULL);
+
+  gtk_style_context_add_provider_for_screen (
+      gdk_screen_get_default (),
+      GTK_STYLE_PROVIDER (prov),
+      GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
 
 NaOverflow *
 na_overflow_new (void)
@@ -1372,35 +1428,7 @@ na_overflow_new (void)
            * once is equivalent and bounded.  It is never removed: one
            * small object for the life of the process, and removing it
            * would break a second drawer that exists meanwhile. */
-          static GtkCssProvider *prov = NULL;
-
-          if (prov == NULL)
-            {
-              prov = gtk_css_provider_new ();
-
-              /* The icons are flattened too (no button chrome of their own):
-               * the hover highlight is painted by the band handler underneath
-               * them, and any opaque button background would hide it again. */
-              gtk_css_provider_load_from_data (prov,
-                  "menuitem.na-overflow-host,"
-                  "menuitem.na-overflow-host:hover,"
-                  "menuitem.na-overflow-host:selected {"
-                  "  background: none;"
-                  "  background-image: none;"
-                  "  box-shadow: none; }"
-                  ".na-overflow-icon {"
-                  "  background: none;"
-                  "  background-image: none;"
-                  "  border-color: transparent;"
-                  "  box-shadow: none; }", -1, NULL);
-              /* For the screen, not for the item's context: a provider added
-               * to one widget's context applies to that widget only, so a
-               * rule targeting the icons never reaches them from here. */
-              gtk_style_context_add_provider_for_screen (
-                  gdk_screen_get_default (),
-                  GTK_STYLE_PROVIDER (prov),
-                  GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-            }
+          na_overflow_install_flat_css ();
 
           gtk_style_context_add_class (ctx, "na-overflow-host");
         }
@@ -1456,7 +1484,38 @@ na_overflow_new (void)
    * stacking.  A managed window cannot be used here: compiz applies its own
    * placement after the map and reports it via configure-notify, which lands
    * later than any move we issue, so the popup flashes in the top-left corner
-   * before it can be corrected (measured). */
+   * before it can be corrected (measured).
+   *
+   * The hover highlight is wired identically to the menu path, with the POPUP
+   * window as the host surface: the grid sits directly in it, so the band
+   * painted here sits under the icon windows (flattened to transparent by the
+   * same CSS) exactly as it does under the icon subsurfaces on Wayland.  The
+   * XEmbed sockets are composited connect_after, so they still land on top of
+   * the band - a parked item is a real X window that cannot be flattened, and
+   * it is not a hover target here. */
+  if (!self->use_menu)
+    {
+      if (g_getenv ("NA_PLAIN") == NULL)
+        na_overflow_install_flat_css ();
+
+      g_signal_connect (self, "draw",
+                        G_CALLBACK (na_overflow_stripe_draw_cb), self);
+      g_signal_connect (self, "motion-notify-event",
+                        G_CALLBACK (na_overflow_hover_motion_cb), self);
+      gtk_widget_add_events (GTK_WIDGET (self), GDK_POINTER_MOTION_MASK);
+
+      g_signal_connect (self->grid, "add",
+                        G_CALLBACK (na_overflow_grid_child_added_cb), self);
+      {
+        GList *ch = gtk_container_get_children (GTK_CONTAINER (self->grid));
+        GList *c;
+        for (c = ch; c != NULL; c = c->next)
+          na_overflow_grid_child_added_cb (GTK_CONTAINER (self->grid),
+                                           c->data, self);
+        g_list_free (ch);
+      }
+    }
+
   return self;
 }
 
@@ -1639,14 +1698,14 @@ dbg_remap_later_cb (gpointer data)
  * check - hiding a socket unmaps the plug's window, which kills the icon. */
 /* Theme-independent hover highlight, painted per GRID CELL.
  *
- * Only the Wayland menu path connects these handlers, and they lean on
- * na_overflow_hover_resolve(), which is Wayland-only. */
-#ifdef HAVE_WAYLAND
+ * Connected from both backends; they lean on na_overflow_hover_resolve(),
+ * which routes by event owner and is backend-agnostic. */
 /* The highlight: one full-height band over the hovered cell's column.
  *
- * Painted on the wrapper menu item - it is windowless, so this lands on the
- * menu surface beneath the icon subsurfaces, and the icons are transparent
- * (the CSS flattens their button chrome), so the band reads continuous from
+ * Painted on the drawer's HOST surface: the wrapper menu item on the Wayland
+ * path (windowless, so the fill lands on the menu surface beneath the icon
+ * subsurfaces), the POPUP window itself on X11.  Icons own a surface on both
+ * backends, and the CSS flattens their chrome, so the band reads continuous from
  * the drawer's top edge to its bottom edge.  The 6px of item padding above
  * and below the grid is part of the band by design: stopping the fill at the
  * grid's allocation made that padding look like a margin INSIDE the drawer
@@ -1742,7 +1801,8 @@ na_overflow_cell_enter_cb (GtkWidget        *child,
    * the drawer hung open forever). The icon's own crossings are therefore
    * the only truthful inside/outside channel for the icon area: clear the
    * outside stamp here. */
-  self->leave_at = 0;
+  if (self->use_menu)
+    self->leave_at = 0;
 
   g_object_ref (child);
   na_overflow_set_hover (self, child);
@@ -1766,8 +1826,12 @@ na_overflow_cell_leave_cb (GtkWidget        *child,
    * only moved to the next icon or onto the drawer's own background, the
    * enter that follows (icon enter, or the item's enter on the menu surface)
    * resets leave_at to 0 - so the false stamp is always repaired before the
-   * 800 ms dwell can act on it. */
-  if (self->leave_at == 0)
+   * 800 ms dwell can act on it.
+   *
+   * Gated on the menu path: on X11 the auto-hide reads the pointer position
+   * against the window rect directly (na_overflow_pointer_inside()) and no
+   * poll consumes leave_at there. */
+  if (self->use_menu && self->leave_at == 0)
     self->leave_at = g_get_monotonic_time ();
 
   /* Guard against the leave of a cell we already left (enter of the next
@@ -1824,7 +1888,7 @@ na_overflow_hover_motion_cb (GtkWidget      *widget,
   na_overflow_set_hover (self, under);
   return FALSE;
 }
-#endif /* HAVE_WAYLAND (hover highlight handlers) */
+
 
 static gboolean
 dbg_later_cb (gpointer data)
