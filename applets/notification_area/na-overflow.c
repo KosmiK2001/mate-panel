@@ -366,6 +366,12 @@ na_overflow_click_line_cb (GObject      *source,
                            GAsyncResult *result,
                            gpointer      user_data)
 {
+  /* user_data owns the reference that na_overflow_read_click_line() took for
+   * this read.  g_cancellable_cancel() does NOT suppress this callback - it
+   * runs with a cancelled result, which is exactly the dispose path
+   * (disarm cancels, then the object can finalize) - so without the ref the
+   * writes below would land in freed memory.  Every exit unrefs; a continued
+   * read takes the next ref before we drop this one. */
   NaOverflow        *self = user_data;
   GDataInputStream  *in = G_DATA_INPUT_STREAM (source);
   g_autofree gchar  *line = NULL;
@@ -379,6 +385,7 @@ na_overflow_click_line_cb (GObject      *source,
       /* The helper closed stdout, or we cancelled the read: a normal end,
        * not an error. */
       self->cw_reading = FALSE;
+      g_object_unref (self);
       return;
     }
 
@@ -396,11 +403,13 @@ na_overflow_click_line_cb (GObject      *source,
       else if (!na_overflow_point_inside (self, (gint) px, (gint) py))
         {
           na_overflow_emit_closed (self);
+          g_object_unref (self);
           return;   /* the window is already going away, no point reading on */
         }
     }
 
-  na_overflow_read_click_line (self);
+  na_overflow_read_click_line (self);   /* takes the next ref, if it arms */
+  g_object_unref (self);
 }
 
 static void
@@ -410,6 +419,7 @@ na_overflow_read_click_line (NaOverflow *self)
     return;
 
   self->cw_reading = TRUE;
+  g_object_ref (self);   /* held by the pending read, dropped in the callback */
   g_data_input_stream_read_line_async (self->cw_in, G_PRIORITY_DEFAULT,
                                        self->cw_cancel,
                                        na_overflow_click_line_cb, self);
@@ -647,6 +657,18 @@ na_overflow_dispose (GObject *object)
     {
       g_object_unref (self->hover_item);
       self->hover_item = NULL;
+    }
+
+  /* The "destroy" watch on relative_to writes into &self->relative_to -
+   * stop it before this object goes away, or the chevron's later death
+   * (na_grid_dispose frees the overflow first, the widget tree after)
+   * would free-write into freed memory. */
+  if (self->relative_to != NULL)
+    {
+      g_signal_handlers_disconnect_by_func (
+          self->relative_to, G_CALLBACK (gtk_widget_destroyed),
+          &self->relative_to);
+      self->relative_to = NULL;
     }
 
   g_clear_object (&self->menu);
@@ -1723,6 +1745,16 @@ na_overflow_popup (NaOverflow   *self,
 
   if (self->relative_to != relative_to)
     {
+      /* Disconnect the previous watch first: the handler writes NULL into
+       * &self->relative_to, so a stale one on an old widget would clear the
+       * NEW pointer when that old widget finally dies - and it would survive
+       * into dispose, writing into freed memory (the chevron outlives the
+       * overflow in na_grid_dispose). */
+      if (self->relative_to != NULL)
+        g_signal_handlers_disconnect_by_func (
+            self->relative_to, G_CALLBACK (gtk_widget_destroyed),
+            &self->relative_to);
+
       self->relative_to = relative_to;
       /* Classic GTK idiom: NULL out the pointer if the widget dies first. */
       g_signal_connect (relative_to, "destroy",

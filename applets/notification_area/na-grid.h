@@ -79,14 +79,17 @@ void            na_grid_set_open_direction    (NaGrid           *grid,
                                                NaOpenDirection   dir);
 void            na_grid_popdown_overflow        (NaGrid             *grid);
 
-/* TRUE if a root-coordinate point falls inside the arrow button. This lets a
- * right click on the arrow reach the applet menu: the shared handler swallows
- * button 3 so that the panel menu does not cover the tray icons' own menus, and
- * without this test the applet menu could only be summoned by clicking the
- * empty space of the applet. */
-gboolean        na_grid_is_chevron_at           (NaGrid *grid,
-                                                 gint    root_x,
-                                                 gint    root_y);
+/* TRUE if a point in the event widget's coordinate space falls inside the
+ * arrow button. This lets a right click on the arrow reach the applet menu:
+ * the shared handler swallows button 3 so that the panel menu does not cover
+ * the tray icons' own menus, and without this test the applet menu could only
+ * be summoned by clicking the empty space of the applet. Pass event->x/y and
+ * the widget receiving the event, not root coordinates - see the function
+ * comment in na-grid.c for why root math fails on Wayland. */
+gboolean        na_grid_is_chevron_at           (NaGrid    *grid,
+                                                 GtkWidget *event_widget,
+                                                 gdouble    ex,
+                                                 gdouble    ey);
 
 /* Accessors for the preferences dialog.  The returned list and its items are
  * owned by the grid. */

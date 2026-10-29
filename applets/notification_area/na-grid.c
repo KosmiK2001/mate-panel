@@ -93,6 +93,8 @@ struct _NaGrid
   guint       size_idle;       /* idle re-asking the panel for our width, 0 = none */
   gint        size_pending;    /* width that idle should request */
   guint       park_idle;       /* idle source id, 0 when none pending */
+  guint       remap_timeout;   /* drawer_remap_cb, 0 when none pending */
+  guint       second_pass_timeout; /* drawer_second_pass_cb, 0 when none */
 
   guint       relaying;
   guint       relayout_dirty;
@@ -121,8 +123,20 @@ static gboolean
 overflow_grid_remap_idle (gpointer data)
 {
   NaGrid    *self = data;
-  GtkWidget *grid = na_overflow_get_grid (self->overflow);
-  GList *children = gtk_container_get_children (GTK_CONTAINER (grid));
+  GtkWidget *grid;
+  GList *children;
+
+  /* The idle holds a ref, so the object is alive here - but after a dispose
+   * its overflow is NULL, and every call below would answer with a stream of
+   * GLib-CRITICALs instead of simply doing nothing. */
+  if (self->destroying || self->overflow == NULL)
+    {
+      g_object_unref (self);
+      return G_SOURCE_REMOVE;
+    }
+
+  grid = na_overflow_get_grid (self->overflow);
+  children = gtk_container_get_children (GTK_CONTAINER (grid));
 
   for (GList *c = children; c != NULL; c = c->next)
     {
@@ -188,6 +202,10 @@ drawer_second_pass_cb (gpointer data)
 {
   NaGrid *self = data;
 
+  self->second_pass_timeout = 0;
+  if (self->destroying)
+    return G_SOURCE_REMOVE;
+
   refresh_grid (self);
 
   /* The request is now the post-map one (measured: 78 -> 90 once the SNI
@@ -202,7 +220,13 @@ drawer_remap_cb (gpointer data)
 {
   NaGrid    *self = data;
   GtkWidget *grid = na_overflow_get_grid (self->overflow);
-  GList     *children = gtk_container_get_children (GTK_CONTAINER (grid));
+  GList     *children;
+
+  self->remap_timeout = 0;
+  if (self->destroying || grid == NULL)
+    return G_SOURCE_REMOVE;
+
+  children = gtk_container_get_children (GTK_CONTAINER (grid));
 
   for (GList *c = children; c != NULL; c = c->next)
     {
@@ -263,7 +287,9 @@ drawer_remap_cb (gpointer data)
    * re-parenting those are still the pre-map ones - measured on the live tray:
    * the first open packed the icons tight and only the next open spaced them
    * properly.  One more pass once mapping has settled fixes the first open. */
-  g_timeout_add (120, drawer_second_pass_cb, self);
+  if (self->second_pass_timeout != 0)
+    g_source_remove (self->second_pass_timeout);
+  self->second_pass_timeout = g_timeout_add (120, drawer_second_pass_cb, self);
 
   /* And re-fit the latched popup allocation to the new request (a mapped
    * GtkMenu does not follow its children - see na_overflow_fit_popup). */
@@ -1643,7 +1669,12 @@ chevron_toggled_cb (GtkToggleButton *button,
     schedule_park (self);   /* not everything fitted yet: finish from the queue */
   reposition_parked (self);
 
-  g_timeout_add (150, drawer_remap_cb, self);
+  /* Tracked and re-armed, never a second copy in flight: the callbacks
+   * dereference the grid, and an untracked one surviving dispose is a
+   * use-after-free (the panel can be replaced ~instantly after an open). */
+  if (self->remap_timeout != 0)
+    g_source_remove (self->remap_timeout);
+  self->remap_timeout = g_timeout_add (150, drawer_remap_cb, self);
 
 }
 
@@ -1705,8 +1736,26 @@ item_removed_cb (NaHost *host,
   if (self->destroying)
     {
       self->items = g_slist_remove (self->items, item);
+      /* Even gated like this, the lists must not outlive the item: the
+       * dispose order is hosts-unref (each item dies here after the last
+       * ref drops) THEN unpark_all_xembed(), and walking a list of freed
+       * widgets is a use-after-free on exactly this path. */
+      if (g_slist_find (self->xembed_parked, widget) ||
+          g_slist_find (self->xembed_pending, widget))
+        unpark_xembed (self, widget);
+      self->overflow_order = g_slist_remove (self->overflow_order, widget);
       return;
     }
+
+  /* Same removal before the container drop, for the runtime case: a parked
+   * XEmbed client that quits while the drawer holds its window must leave no
+   * stale entry behind - the next unpark_all_xembed() (unrealize/dispose)
+   * would dereference the freed socket.  Before gtk_container_remove(),
+   * which may be the last ref. */
+  if (g_slist_find (self->xembed_parked, widget) ||
+      g_slist_find (self->xembed_pending, widget))
+    unpark_xembed (self, widget);
+  self->overflow_order = g_slist_remove (self->overflow_order, widget);
 
   parent = gtk_widget_get_parent (widget);
   if (parent != NULL)
@@ -2047,6 +2096,22 @@ na_grid_dispose (GObject *object)
       self->park_idle = 0;
     }
 
+  /* The drawer's remap chain is armed per open and outlives the last frame
+   * of the panel by up to 270 ms - without the removals below a
+   * "mate-panel --replace" right after an open fires them on freed memory
+   * (same class as park_idle/size_idle above, which were already tracked). */
+  if (self->remap_timeout != 0)
+    {
+      g_source_remove (self->remap_timeout);
+      self->remap_timeout = 0;
+    }
+
+  if (self->second_pass_timeout != 0)
+    {
+      g_source_remove (self->second_pass_timeout);
+      self->second_pass_timeout = 0;
+    }
+
   if (self->size_idle != 0)
     {
       g_source_remove (self->size_idle);
@@ -2272,41 +2337,49 @@ na_grid_popdown_overflow (NaGrid *grid)
     na_overflow_popdown (grid->overflow);
 }
 
-/* Is a root-coordinate point inside the arrow.
+/* Is an event-coordinate point inside the arrow.
  *
- * Computed by translating into the toplevel and taking the toplevel's origin,
- * not gdk_window_get_origin(arrow): the button may have no GdkWindow of its
- * own, in which case the coordinates would be garbage. */
+ * The point comes in the event widget's coordinate space (what a
+ * button-press vfunc sees in event->x/y) and is translated straight to the
+ * chevron - no root coordinates involved anywhere, because on Wayland
+ * gdk_window_get_origin() of the panel's layer-shell surface answers
+ * surface-relative and every root-rect comparison silently misses. */
 gboolean
-na_grid_is_chevron_at (NaGrid *grid,
-                       gint    root_x,
-                       gint    root_y)
+na_grid_is_chevron_at (NaGrid    *grid,
+                       GtkWidget *event_widget,
+                       gdouble    ex,
+                       gdouble    ey)
 {
-  GtkWidget *toplevel;
-  gint tx = 0, ty = 0, ox = 0, oy = 0, w, h;
+  gint cx = 0, cy = 0;
+  gint w, h;
 
   g_return_val_if_fail (NA_IS_GRID (grid), FALSE);
 
   if (grid->chevron == NULL || !gtk_widget_get_realized (grid->chevron))
     return FALSE;
 
-  toplevel = gtk_widget_get_toplevel (grid->chevron);
-  if (toplevel == NULL || !gtk_widget_get_realized (toplevel))
+  /* Root coordinates cannot be used here: gdk_window_get_origin() on the
+   * panel answers SURFACE-relative for its layer-shell surface (measured:
+   * root_y=1 on a 1080p screen whose panel sits at y=1053), so comparing
+   * event->x_root against an origin-derived rect missed the chevron
+   * everywhere on Wayland - the right-click that should open the applet
+   * menu was swallowed instead.  Event-widget-relative coordinates and
+   * gtk_widget_translate_coordinates() are truthful on both backends: the
+   * chevron and the event widget live in the same toplevel, and GTK walks
+   * the allocation tree rather than asking the compositor where it is. */
+  if (event_widget == NULL || !gtk_widget_get_realized (event_widget))
     return FALSE;
 
-  if (!gtk_widget_translate_coordinates (grid->chevron, toplevel, 0, 0, &tx, &ty))
+  if (!gtk_widget_translate_coordinates (event_widget, grid->chevron,
+                                         (gint) ex, (gint) ey, &cx, &cy))
     return FALSE;
-
-  gdk_window_get_origin (gtk_widget_get_window (toplevel), &ox, &oy);
-  ox += tx;
-  oy += ty;
 
   w = gtk_widget_get_allocated_width (grid->chevron);
   h = gtk_widget_get_allocated_height (grid->chevron);
   if (w <= 0 || h <= 0)
     return FALSE;
 
-  return root_x >= ox && root_x < ox + w && root_y >= oy && root_y < oy + h;
+  return cx >= 0 && cx < w && cy >= 0 && cy < h;
 }
 
 const GSList *

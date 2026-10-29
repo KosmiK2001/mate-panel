@@ -666,7 +666,7 @@ na_tray_applet_button_press_event (GtkWidget      *widget,
        * was swallowed here. Tray icons are still swallowed, or the panel menu
        * would cover the application's own menu. */
       if (na_grid_is_chevron_at (NA_GRID (NA_TRAY_APPLET (widget)->priv->grid),
-                                 (gint) event->x_root, (gint) event->y_root))
+                                 widget, event->x, event->y))
         return GTK_WIDGET_CLASS (na_tray_applet_parent_class)->button_press_event (widget, event);
 
       return TRUE;
