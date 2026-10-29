@@ -22,6 +22,10 @@
 
 #include "na-item.h"
 
+#ifdef HAVE_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
+
 struct _SnItemPrivate
 {
   gchar          *bus_name;
@@ -227,19 +231,37 @@ sn_item_button_press_event (GtkWidget      *widget,
     {
       if (priv->menu != NULL)
         {
-          GtkWidget *menu_win;
-          GtkWidget *item_toplevel;
+#ifdef HAVE_WAYLAND
+          if (GDK_IS_WAYLAND_DISPLAY (gdk_display_get_default ()))
+            {
+              GtkWidget *menu_win;
 
-          /* Realize so GTK creates the Wayland surface */
-          gtk_widget_realize (GTK_WIDGET (priv->menu));
+              /* Realize so GTK creates the Wayland surface */
+              gtk_widget_realize (GTK_WIDGET (priv->menu));
 
-          /* Set attached_to so GTK uses transient parent for xdg_popup */
-          menu_win = gtk_widget_get_toplevel (GTK_WIDGET (priv->menu));
-          item_toplevel = gtk_widget_get_toplevel (widget);
-          if (GTK_IS_WINDOW (menu_win))
-            gtk_window_set_attached_to (GTK_WINDOW (menu_win), item_toplevel);
+              /* Set attached_to so GTK uses transient parent for xdg_popup */
+              menu_win = gtk_widget_get_toplevel (GTK_WIDGET (priv->menu));
+              if (GTK_IS_WINDOW (menu_win))
+                gtk_window_set_attached_to (
+                    GTK_WINDOW (menu_win),
+                    gtk_widget_get_toplevel (widget));
 
-          gtk_menu_popup_at_pointer (priv->menu, (GdkEvent *) event);
+              /* wlroots 0.20 mishandles the surface-relative coordinate
+               * translation of popup_at_widget (menus landed at (0,0) or
+               * screen-center, measured) - at_pointer uses the event's own
+               * pointer position and is the reliable path there. */
+              gtk_menu_popup_at_pointer (priv->menu, (GdkEvent *) event);
+            }
+          else
+#endif
+            {
+              gtk_menu_popup_at_widget (priv->menu, widget,
+                                        GDK_GRAVITY_SOUTH_WEST,
+                                        GDK_GRAVITY_NORTH_WEST,
+                                        (GdkEvent *) event);
+              /*Fix positioning if size changed since last shown*/
+              gtk_menu_reposition(priv->menu);
+            }
         }
       else
         {
@@ -266,17 +288,40 @@ sn_item_popup_menu (GtkWidget *widget)
 
   if (priv->menu != NULL)
     {
-      GtkWidget *menu_win;
-      GtkWidget *item_toplevel;
+#ifdef HAVE_WAYLAND
+      if (GDK_IS_WAYLAND_DISPLAY (gdk_display_get_default ()))
+        {
+          GtkWidget *menu_win;
 
-      gtk_widget_realize (GTK_WIDGET (priv->menu));
+          gtk_widget_realize (GTK_WIDGET (priv->menu));
 
-      menu_win = gtk_widget_get_toplevel (GTK_WIDGET (priv->menu));
-      item_toplevel = gtk_widget_get_toplevel (widget);
-      if (GTK_IS_WINDOW (menu_win))
-        gtk_window_set_attached_to (GTK_WINDOW (menu_win), item_toplevel);
+          menu_win = gtk_widget_get_toplevel (GTK_WIDGET (priv->menu));
+          if (GTK_IS_WINDOW (menu_win))
+            gtk_window_set_attached_to (
+                GTK_WINDOW (menu_win),
+                gtk_widget_get_toplevel (widget));
 
-      gtk_menu_popup_at_pointer (priv->menu, NULL);
+          /* See the button-press branch for why Wayland cannot use
+           * at_widget here. With no event, at_pointer places the menu at
+           * the current pointer position - the best available anchor on
+           * wlroots. */
+          gtk_menu_popup_at_pointer (priv->menu, NULL);
+        }
+      else
+#endif
+        {
+          /* X11 keeps the upstream widget anchor: a keyboard-invoked menu
+           * (NULL event) must open against the ICON, not wherever the
+           * pointer happens to be (measured regression of the unconditional
+           * at_pointer switch: Shift+F10 opened the menu across the
+           * screen). */
+          gtk_menu_popup_at_widget (priv->menu, widget,
+                                    GDK_GRAVITY_SOUTH_WEST,
+                                    GDK_GRAVITY_NORTH_WEST,
+                                    NULL);
+          /*Fix positioning if size changed since last shown*/
+          gtk_menu_reposition(priv->menu);
+        }
     }
   else
     {

@@ -397,7 +397,17 @@ item_state (NaGrid *self,
     return NA_ITEM_STATE_PINNED;
 
   if (g_hash_table_contains (self->hidden_ids, id))
-    return NA_ITEM_STATE_HIDDEN;
+    {
+      /* The hidden list is SNI-only (na-grid.h contract): hiding a GtkSocket
+       * unmaps the plug window, which is not something every XEmbed client
+       * survives - and unlike the drawer parking (the widget stays a child
+       * of this grid and only its window travels), a hidden socket has no
+       * path back short of the client redrawing.  Pin it instead. */
+      if (!SN_IS_ITEM (item))
+        return NA_ITEM_STATE_PINNED;
+
+      return NA_ITEM_STATE_HIDDEN;
+    }
 
   if (g_hash_table_contains (self->overflow_ids, id))
     return NA_ITEM_STATE_OVERFLOW;
@@ -985,29 +995,10 @@ place_item (NaGrid     *self,
 
   if (target == NULL)
     {
-      if (!SN_IS_ITEM (item))
-        {
-          /* Hidden system-tray icon: hide it where it stands.  Parking is not
-           * an option - gtk_container_remove() on a GtkSocket brings the plug
-           * down (measured: "plug-removed" arrives, socket_probe step 4), and
-           * a raw XReparentWindow out of it is caught by GtkPlug itself
-           * (gtkplug.c:941 plus an assert in gtk_plug_set_is_child).
-           *
-           * Staying attached is harmless for the layout, measured: GtkGrid
-           * excludes invisible children from its size request (three visible
-           * 30px children with a fourth hidden one attached at column 40 still
-           * requested 90px, not 1200px), and putting a visible child in the
-           * cell an invisible one occupies produces no diagnostic.
-           *
-           * na_grid_draw() has to skip invisible children explicitly: the
-           * XEmbed alpha path paints the socket window straight into the
-           * parent and never consults gtk_widget_is_drawable(). */
-          if (parent == NULL)
-            gtk_container_add (GTK_CONTAINER (self), item);  /* sinks the float */
-
-          gtk_widget_hide (item);
-          return;
-        }
+      /* Only SNI items can reach HIDDEN: item_state() pins XEmbed ones (see
+       * there - hiding a socket unmaps the plug).  The earlier revision did
+       * hide XEmbed items in place, which contradicted the na-grid.h
+       * contract and left the plug unmapped for the client to notice. */
 
       /* Hidden.  ref_sink because an item that has never been placed is still
        * floating: the plain ref would warn and gain nothing. */

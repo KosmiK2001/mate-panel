@@ -59,11 +59,13 @@ void            na_grid_set_min_icon_size       (NaGrid *grid,
 GtkWidget      *na_grid_new                     (GtkOrientation orientation);
 void            na_grid_force_redraw            (NaGrid *grid);
 
-/* Overflow support.  The id lists are matched against na_item_get_id() and are
- * only honoured for StatusNotifierItem icons: XEmbed icons always stay on the
- * panel, because keeping an embedded socket unmapped for a long time is not
- * something every client survives.  Both lists empty means an ordinary,
- * unpatched-looking notification area. */
+/* Overflow support.  The id lists are matched against na_item_get_id().
+ * The overflow list applies to both icon kinds: an XEmbed icon travels to the
+ * drawer as a WINDOW (parking - the widget stays a child of the panel grid),
+ * an SNI icon as a widget.  The hidden list is StatusNotifierItem-only:
+ * hiding a socket unmaps the plug, which is not something every XEmbed client
+ * survives, so item_state() pins such ids back to the panel.  Both lists
+ * empty means an ordinary, unpatched-looking notification area. */
 void            na_grid_set_hidden_icons        (NaGrid             *grid,
                                                  const gchar *const *ids);
 void            na_grid_set_overflow_icons      (NaGrid             *grid,

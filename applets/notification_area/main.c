@@ -327,7 +327,11 @@ append_icon_row (NaTrayApplet *applet,
   combo = gtk_combo_box_text_new ();
   gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (combo), _("Shown on the panel"));
   gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (combo), _("In the overflow popup"));
-  gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (combo), _("Hidden completely"));
+  /* "Hidden completely" is SNI-only: the grid pins XEmbed items out of that
+   * state (hiding a socket unmaps the plug - see item_state() in na-grid.c),
+   * so offering it would write a setting that silently never applies. */
+  if (na_grid_item_is_sni (NA_GRID (applet->priv->grid), item))
+    gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (combo), _("Hidden completely"));
 
   gtk_combo_box_set_active (GTK_COMBO_BOX (combo),
                             state == NA_ITEM_STATE_OVERFLOW ? 1 :
