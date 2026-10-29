@@ -534,6 +534,7 @@ na_overflow_autohide_cb (gpointer data)
         self->outside_since = now;
       else if (now - self->outside_since >= (gint64) self->autohide_ms * 1000)
         hide = TRUE;
+
     }
 
   if (hide)
@@ -766,10 +767,21 @@ na_overflow_menu_motion_cb (GtkWidget      *widget,
   /* Motion that arrived on a DESCENDANT's window (an SNI button is a
    * GtkButton, which owns one) means the pointer is over that button.
    * event->x/y there are button-relative and GTK does not re-translate them as
-   * the event propagates, so only the window identity is usable. */
+   * the event propagates, so only the window identity is usable.
+   *
+   * EXCEPT during the leave transition itself (measured): after the icon's
+   * leave crossing already stamped "outside", GDK still delivers the
+   * pointer's final motions carrying the icon's window - an unconditional
+   * reset here resurrected "inside" at exactly the moment the drawer should
+   * fold, and no further event ever arrived (the pointer is off the popup
+   * and the motion channel dies there). A live hover is the discriminator:
+   * while the pointer truly is on an icon, hover_item is set by its enter
+   * crossing; a stale delivery after the leave finds it cleared. */
   if (sw != NULL && event->window != sw)
     {
-      self->leave_at = 0;
+      if (self->hover_item != NULL)
+        self->leave_at = 0;
+
       return FALSE;
     }
 
@@ -814,8 +826,16 @@ na_overflow_menu_item_leave_cb (GtkWidget        *widget,
       event->mode == GDK_CROSSING_STATE_CHANGED)
     return FALSE;
 
-  /* INFERIOR = onto a child window, still inside the drawer. */
-  if (event->detail == GDK_NOTIFY_INFERIOR)
+  /* Window identity, not event->detail, separates the real transitions
+   * from the icon-churn ones (measured): the item is windowless, so a
+   * crossing that ARRIVED on an icon's own subsurface propagates up to this
+   * handler carrying that window - and GTK synthesizes the item's counterpart
+   * with detail=NONLINEAR (3), not the INFERIOR (2) the old filter tested
+   * for, so the filter never matched: every icon-leave produced a phantom
+   * item-leave+item-enter pair that reset leave_at, and the drawer hung open
+   * when the pointer left the drawer FROM AN ICON. Events on the menu's own
+   * surface are the real on/off crossings of the drawer. */
+  if (event->window != gtk_widget_get_window (self->menu))
     return FALSE;
 
   if (self->leave_at == 0)
@@ -836,6 +856,12 @@ na_overflow_menu_item_enter_cb (GtkWidget        *widget,
   if (event->mode == GDK_CROSSING_GTK_GRAB ||
       event->mode == GDK_CROSSING_GTK_UNGRAB ||
       event->mode == GDK_CROSSING_STATE_CHANGED)
+    return FALSE;
+
+  /* See na_overflow_menu_item_leave_cb: only the menu surface's own
+   * crossings are real; icon-propagated ones must not clear an outside
+   * stamp (that was the hang-open). */
+  if (event->window != gtk_widget_get_window (self->menu))
     return FALSE;
 
   self->leave_at = 0;
@@ -1623,13 +1649,23 @@ na_overflow_cell_enter_cb (GtkWidget        *child,
                            GdkEventCrossing *event,
                            gpointer          user_data)
 {
+  NaOverflow *self = user_data;
+
   if (event->mode == GDK_CROSSING_GTK_GRAB ||
       event->mode == GDK_CROSSING_GTK_UNGRAB ||
       event->mode == GDK_CROSSING_STATE_CHANGED)
     return FALSE;
 
+  /* The icon is its own subsurface: while the pointer is on it, the menu's
+   * surface sees nothing (no motion, no item enter/leave - measured: leaving
+   * the drawer FROM AN ICON delivered zero events, so leave_at stayed 0 and
+   * the drawer hung open forever). The icon's own crossings are therefore
+   * the only truthful inside/outside channel for the icon area: clear the
+   * outside stamp here. */
+  self->leave_at = 0;
+
   g_object_ref (child);
-  na_overflow_set_hover (user_data, child);
+  na_overflow_set_hover (self, child);
   return FALSE;
 }
 
@@ -1644,6 +1680,15 @@ na_overflow_cell_leave_cb (GtkWidget        *child,
       event->mode == GDK_CROSSING_GTK_UNGRAB ||
       event->mode == GDK_CROSSING_STATE_CHANGED)
     return FALSE;
+
+  /* Tentative "outside": if the pointer really left the drawer, nothing
+   * clears this and the auto-hide poll folds it after autohide_ms. If it
+   * only moved to the next icon or onto the drawer's own background, the
+   * enter that follows (icon enter, or the item's enter on the menu surface)
+   * resets leave_at to 0 - so the false stamp is always repaired before the
+   * 800 ms dwell can act on it. */
+  if (self->leave_at == 0)
+    self->leave_at = g_get_monotonic_time ();
 
   /* Guard against the leave of a cell we already left (enter of the next
    * icon may arrive first under a grab): only clear if WE are lit. */
