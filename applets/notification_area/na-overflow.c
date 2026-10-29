@@ -671,6 +671,14 @@ na_overflow_dispose (GObject *object)
       self->relative_to = NULL;
     }
 
+  /* The menu is a toplevel that never lived in this window's hierarchy, so
+   * dropping the ref is not enough: GTK keeps every realized toplevel on the
+   * display's list until it is destroyed, and the xdg_popup surface would
+   * outlive the drawer.  It is down by now - na_grid_dispose popdowns first,
+   * and the shell's own "deactivate" path cannot be running here. */
+  if (self->menu != NULL)
+    gtk_widget_destroy (self->menu);
+
   g_clear_object (&self->menu);
 
   G_OBJECT_CLASS (na_overflow_parent_class)->dispose (object);
@@ -1255,32 +1263,46 @@ na_overflow_new (void)
          * Padding is deliberately left alone: zeroing it shrinks the cells. */
         {
           GtkStyleContext *ctx = gtk_widget_get_style_context (item);
-          GtkCssProvider  *prov = gtk_css_provider_new ();
-  
-          /* The icons are flattened too (no button chrome of their own):
-           * the hover highlight is painted by na_overflow_hover_draw_cb()
-           * underneath them, and any opaque button background would hide
-           * it again. */
-          gtk_css_provider_load_from_data (prov,
-              "menuitem.na-overflow-host,"
-              "menuitem.na-overflow-host:hover,"
-              "menuitem.na-overflow-host:selected {"
-              "  background: none;"
-              "  background-image: none;"
-              "  box-shadow: none; }"
-              ".na-overflow-icon {"
-              "  background: none;"
-              "  background-image: none;"
-              "  border-color: transparent;"
-              "  box-shadow: none; }", -1, NULL);
-          /* For the screen, not for the item's context: a provider added to one
-           * widget's context applies to that widget only, so a rule targeting
-           * the icons never reached them from here. */
-          gtk_style_context_add_provider_for_screen (gdk_screen_get_default (),
-                                                     GTK_STYLE_PROVIDER (prov),
-                                                     GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+          /* One provider per process, not per drawer: this runs on every
+           * NaGrid construction, so an unconditional install registered a
+           * new global provider each time the applet was added or the
+           * panel restarted, and none was ever removed.  The rules are
+           * identical every time and the classes are ours, so installing
+           * once is equivalent and bounded.  It is never removed: one
+           * small object for the life of the process, and removing it
+           * would break a second drawer that exists meanwhile. */
+          static GtkCssProvider *prov = NULL;
+
+          if (prov == NULL)
+            {
+              prov = gtk_css_provider_new ();
+
+              /* The icons are flattened too (no button chrome of their own):
+               * the hover highlight is painted by the band handler underneath
+               * them, and any opaque button background would hide it again. */
+              gtk_css_provider_load_from_data (prov,
+                  "menuitem.na-overflow-host,"
+                  "menuitem.na-overflow-host:hover,"
+                  "menuitem.na-overflow-host:selected {"
+                  "  background: none;"
+                  "  background-image: none;"
+                  "  box-shadow: none; }"
+                  ".na-overflow-icon {"
+                  "  background: none;"
+                  "  background-image: none;"
+                  "  border-color: transparent;"
+                  "  box-shadow: none; }", -1, NULL);
+              /* For the screen, not for the item's context: a provider added
+               * to one widget's context applies to that widget only, so a
+               * rule targeting the icons never reaches them from here. */
+              gtk_style_context_add_provider_for_screen (
+                  gdk_screen_get_default (),
+                  GTK_STYLE_PROVIDER (prov),
+                  GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+            }
+
           gtk_style_context_add_class (ctx, "na-overflow-host");
-          g_object_unref (prov);
         }
   
         g_signal_connect (item, "motion-notify-event",

@@ -40,7 +40,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
 #include <X11/extensions/record.h>
-#include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -162,9 +162,19 @@ int main (void)
       if (select (fd + 1, &rfd, NULL, NULL, &tv) > 0 && FD_ISSET (fd, &rfd))
         XRecordProcessReplies (dpy);
 
-      /* stdout closed: the parent is gone */
-      if (errno == 0 && write (STDOUT_FILENO, "", 0) < 0 && errno == EPIPE)
-        break;
+      /* The parent closed its end of the pipe: POLLHUP on the write end,
+       * which is how a dead reader shows up.  (The previous version probed
+       * with write(STDOUT, "", 0), but POSIX says a zero-byte write returns
+       * 0 without touching errno, so that test could never fire and the
+       * helper outlived a crashed panel until the parent's SIGTERM - which
+       * of course never came from a crashed parent.) */
+      {
+        struct pollfd pfd = { .fd = STDOUT_FILENO, .events = POLLOUT };
+
+        if (poll (&pfd, 1, 0) == 1 &&
+            (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+          break;
+      }
     }
 
   XRecordDisableContext (dpy, ctx);
